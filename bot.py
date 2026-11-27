@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import hmac
+import html
 import os
 import re
 import secrets
@@ -90,10 +91,36 @@ class Service:
 
     async def start(self, request):
         self.store.cleanup()
-        ticket = request.query.get('ticket', '')
+        form = await request.post() if request.method == 'POST' else None
+        ticket = form.get('ticket', '') if form is not None else request.query.get('ticket', '')
         row = self.store.run('SELECT * FROM pending WHERE ticket=?', (digest(ticket),)).fetchone()
         if not row:
-            raise web.HTTPBadRequest(text='Link expired or already opened. Run /link again in Discord.')
+            raise web.HTTPBadRequest(text='This link expired, was replaced, or sign-in already started. '
+                                    'Get a fresh /osulink code in Roblox, then use /link in Discord.')
+        if request.method != 'POST':
+            # Link previews and scanners may GET/HEAD the URL before the player does.
+            # Only an explicit form submission consumes the ticket or starts OAuth.
+            nonce = secrets.token_urlsafe(32)
+            response = web.Response(content_type='text/html', text=f'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Link your osu! account</title></head><body>
+<h1>Link your osu! account</h1>
+<p>Linking Roblox user ID {html.escape(row['roblox'])}. Continue only if this is your account.</p>
+<form method="post" action="/oauth/start">
+<input type="hidden" name="ticket" value="{html.escape(ticket, quote=True)}">
+<input type="hidden" name="nonce" value="{nonce}">
+<button type="submit">Continue to osu!</button></form>
+<p>After signing in, approve your osu! ID inside Roblox.</p></body></html>''')
+            response.headers['Cache-Control'] = 'no-store'
+            response.headers['Referrer-Policy'] = 'no-referrer'
+            response.headers['Content-Security-Policy'] = "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+            response.set_cookie('link_start', nonce, secure=True, httponly=True,
+                                samesite='Lax', max_age=600, path='/oauth')
+            return response
+        nonce = form.get('nonce', '')
+        if (request.headers.get('Origin') != self.base or not nonce or
+                not hmac.compare_digest(nonce, request.cookies.get('link_start', ''))):
+            raise web.HTTPBadRequest(text='Invalid browser session. Reopen your Discord sign-in link.')
         state, cookie = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         self.store.run('UPDATE pending SET ticket=NULL, state=?, cookie=? WHERE roblox=?',
                        (digest(state), digest(cookie), row['roblox']))
@@ -103,6 +130,7 @@ class Service:
         response = web.HTTPFound(url)
         response.set_cookie('link_session', cookie, secure=True, httponly=True,
                             samesite='Lax', max_age=600, path='/oauth')
+        response.del_cookie('link_start', path='/oauth')
         return response
 
     async def callback(self, request):
@@ -112,7 +140,7 @@ class Service:
         if not row or not hmac.compare_digest(row['cookie'] or '', digest(request.cookies.get('link_session', ''))):
             raise web.HTTPBadRequest(text='Invalid browser session. Restart /link in Discord.')
         # Consume before any network await, preventing callback replay.
-        self.store.run('UPDATE pending SET state=NULL, cookie=NULL WHERE roblox=?', (row['roblox'],))
+        self.store.run('UPDATE pending SET state=NULL WHERE roblox=?', (row['roblox'],))
         if 'code' not in request.query:
             raise web.HTTPBadRequest(text='Authorization cancelled. Restart /link in Discord.')
         token = await self.token(grant_type='authorization_code', code=request.query['code'],
@@ -120,8 +148,11 @@ class Service:
         user = await self.osu_request('GET', '/api/v2/me',
                                      headers={'Authorization': 'Bearer ' + token['access_token']})
         # Do not persist user access or refresh tokens. Public stats use an app token.
-        self.store.run('UPDATE pending SET osu=?, username=? WHERE roblox=? AND code=? AND expires>?',
-                       (str(user['id']), user['username'], row['roblox'], row['code'], time.time()))
+        updated = self.store.run('UPDATE pending SET osu=?, username=?, cookie=NULL '
+                                'WHERE roblox=? AND code=? AND cookie=? AND state IS NULL AND expires>?',
+                       (str(user['id']), user['username'], row['roblox'], row['code'], row['cookie'], time.time()))
+        if updated.rowcount != 1:
+            raise web.HTTPBadRequest(text='This request expired or was replaced during sign-in. Restart /link in Discord.')
         response = web.Response(text=f"Verified osu! account {user['username']} (ID {user['id']}). "
                                f"Return to Roblox and type /osuapprove {user['id']} to finish. "
                                'Only approve if this is your own account.')
@@ -240,6 +271,7 @@ class Service:
 
         app = web.Application(middlewares=[headers], client_max_size=2048)
         app.router.add_get('/oauth/start', self.start)
+        app.router.add_post('/oauth/start', self.start)
         app.router.add_get('/oauth/callback', self.callback)
         app.router.add_route('*', '/game/{roblox}/{action}', self.game)
         app.router.add_get('/health', lambda request: web.json_response({'ok': True}))
