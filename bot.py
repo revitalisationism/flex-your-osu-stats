@@ -33,6 +33,10 @@ class Store:
                 roblox TEXT PRIMARY KEY, code TEXT UNIQUE NOT NULL,
                 expires REAL NOT NULL, discord TEXT UNIQUE, ticket TEXT UNIQUE,
                 state TEXT UNIQUE, cookie TEXT, osu TEXT, username TEXT);
+            CREATE TABLE IF NOT EXISTS oauth_sessions (
+                state TEXT PRIMARY KEY, cookie TEXT NOT NULL,
+                roblox TEXT NOT NULL, code TEXT NOT NULL, ticket TEXT NOT NULL,
+                expires REAL NOT NULL);
         ''')
 
     def run(self, sql, args=()):
@@ -41,6 +45,10 @@ class Store:
 
     def cleanup(self):
         self.run('DELETE FROM pending WHERE expires <= ?', (time.time(),))
+        self.run('''DELETE FROM oauth_sessions WHERE expires <= ? OR NOT EXISTS (
+            SELECT 1 FROM pending p WHERE p.roblox=oauth_sessions.roblox
+            AND p.code=oauth_sessions.code AND p.ticket=oauth_sessions.ticket
+            AND p.osu IS NULL)''', (time.time(),))
 
     def approve(self, roblox, osu):
         self.cleanup()
@@ -95,11 +103,14 @@ class Service:
         ticket = form.get('ticket', '') if form is not None else request.query.get('ticket', '')
         row = self.store.run('SELECT * FROM pending WHERE ticket=?', (digest(ticket),)).fetchone()
         if not row:
-            raise web.HTTPBadRequest(text='This link expired, was replaced, or sign-in already started. '
+            raise web.HTTPBadRequest(text='This link expired, was replaced, or linking is complete. '
                                     'Get a fresh /osulink code in Roblox, then use /link in Discord.')
+        if row['osu']:
+            return web.Response(text=f"osu! account {row['username']} (ID {row['osu']}) is verified. "
+                                f"Return to Roblox and type /osuapprove {row['osu']} to finish.")
         if request.method != 'POST':
             # Link previews and scanners may GET/HEAD the URL before the player does.
-            # Only an explicit form submission consumes the ticket or starts OAuth.
+            # Only an explicit form submission starts OAuth. The ticket stays reusable.
             nonce = secrets.token_urlsafe(32)
             response = web.Response(content_type='text/html', text=f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -114,49 +125,51 @@ class Service:
             response.headers['Cache-Control'] = 'no-store'
             response.headers['Referrer-Policy'] = 'no-referrer'
             response.headers['Content-Security-Policy'] = "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
-            response.set_cookie('link_start', nonce, secure=True, httponly=True,
+            response.set_cookie('link_start_' + digest(nonce), nonce, secure=True, httponly=True,
                                 samesite='Lax', max_age=600, path='/oauth')
             return response
         nonce = form.get('nonce', '')
         if (request.headers.get('Origin') != self.base or not nonce or
-                not hmac.compare_digest(nonce, request.cookies.get('link_start', ''))):
+                not hmac.compare_digest(nonce, request.cookies.get('link_start_' + digest(nonce), ''))):
             raise web.HTTPBadRequest(text='Invalid browser session. Reopen your Discord sign-in link.')
         state, cookie = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
-        self.store.run('UPDATE pending SET ticket=NULL, state=?, cookie=? WHERE roblox=?',
-                       (digest(state), digest(cookie), row['roblox']))
+        self.store.run('INSERT INTO oauth_sessions VALUES (?,?,?,?,?,?)',
+                       (digest(state), digest(cookie), row['roblox'], row['code'], row['ticket'], row['expires']))
         url = 'https://osu.ppy.sh/oauth/authorize?' + urlencode({
             'client_id': os.environ['OSU_CLIENT_ID'], 'redirect_uri': self.base + '/oauth/callback',
             'response_type': 'code', 'scope': 'identify', 'state': state})
         response = web.HTTPFound(url)
-        response.set_cookie('link_session', cookie, secure=True, httponly=True,
+        response.set_cookie('link_session_' + digest(state), cookie, secure=True, httponly=True,
                             samesite='Lax', max_age=600, path='/oauth')
-        response.del_cookie('link_start', path='/oauth')
+        response.del_cookie('link_start_' + digest(nonce), path='/oauth')
         return response
 
     async def callback(self, request):
         self.store.cleanup()
         state = digest(request.query.get('state', ''))
-        row = self.store.run('SELECT * FROM pending WHERE state=?', (state,)).fetchone()
-        if not row or not hmac.compare_digest(row['cookie'] or '', digest(request.cookies.get('link_session', ''))):
-            raise web.HTTPBadRequest(text='Invalid browser session. Restart /link in Discord.')
+        row = self.store.run('SELECT * FROM oauth_sessions WHERE state=?', (state,)).fetchone()
+        if not row or not hmac.compare_digest(row['cookie'], digest(request.cookies.get('link_session_' + state, ''))):
+            raise web.HTTPBadRequest(text='Invalid or completed browser session. Reopen the original Discord sign-in link.')
         # Consume before any network await, preventing callback replay.
-        self.store.run('UPDATE pending SET state=NULL WHERE roblox=?', (row['roblox'],))
+        self.store.run('DELETE FROM oauth_sessions WHERE state=?', (state,))
         if 'code' not in request.query:
-            raise web.HTTPBadRequest(text='Authorization cancelled. Restart /link in Discord.')
+            raise web.HTTPBadRequest(text='Authorization cancelled. You can reopen the same Discord sign-in link.')
         token = await self.token(grant_type='authorization_code', code=request.query['code'],
                                  redirect_uri=self.base + '/oauth/callback')
         user = await self.osu_request('GET', '/api/v2/me',
                                      headers={'Authorization': 'Bearer ' + token['access_token']})
         # Do not persist user access or refresh tokens. Public stats use an app token.
-        updated = self.store.run('UPDATE pending SET osu=?, username=?, cookie=NULL '
-                                'WHERE roblox=? AND code=? AND cookie=? AND state IS NULL AND expires>?',
-                       (str(user['id']), user['username'], row['roblox'], row['code'], row['cookie'], time.time()))
+        updated = self.store.run('UPDATE pending SET osu=?, username=?, cookie=NULL, state=NULL '
+                                'WHERE roblox=? AND code=? AND ticket=? AND osu IS NULL AND expires>?',
+                       (str(user['id']), user['username'], row['roblox'], row['code'], row['ticket'], time.time()))
         if updated.rowcount != 1:
-            raise web.HTTPBadRequest(text='This request expired or was replaced during sign-in. Restart /link in Discord.')
+            raise web.HTTPBadRequest(text='This request expired, was replaced, or verification completed in another tab. '
+                                    'Reopen your latest Discord sign-in link to check.')
+        self.store.cleanup()
         response = web.Response(text=f"Verified osu! account {user['username']} (ID {user['id']}). "
                                f"Return to Roblox and type /osuapprove {user['id']} to finish. "
                                'Only approve if this is your own account.')
-        response.del_cookie('link_session', path='/oauth')
+        response.del_cookie('link_session_' + state, path='/oauth')
         return response
 
     async def game(self, request):
@@ -274,7 +287,7 @@ class Service:
         app.router.add_post('/oauth/start', self.start)
         app.router.add_get('/oauth/callback', self.callback)
         app.router.add_route('*', '/game/{roblox}/{action}', self.game)
-        app.router.add_get('/health', lambda request: web.json_response({'ok': True}))
+        app.router.add_get('/health', lambda request: web.json_response({'ok': True, 'version': 'reusable-links-v2'}))
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as self.http:
             runner = web.AppRunner(app, access_log=None)
             await runner.setup()
